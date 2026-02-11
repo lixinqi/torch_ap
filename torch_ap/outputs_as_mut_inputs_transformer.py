@@ -1,7 +1,6 @@
 import torch
 import torch.fx as fx
-import torch.utils._pytree as pytree
-from typing import List, Any
+from typing import List
 
 
 class OutputAsMutInputsTransformer:
@@ -12,7 +11,7 @@ class OutputAsMutInputsTransformer:
     def __call__(
         self,
         target: fx.GraphModule,
-        example_inputs: Any,
+        example_inputs: List[torch.Tensor],
     ) -> fx.GraphModule:
         # 1. ($graph_module_with_sole_submodule <- $target)
         gm_with_sub, placeholder_nodes = self._fold_to_sole_submodule(target)
@@ -20,17 +19,17 @@ class OutputAsMutInputsTransformer:
         # Extract dtypes and shapes from example_inputs
         if isinstance(example_inputs, (tuple, list)):
             input_dtypes = [inp.dtype for inp in example_inputs]
-            symbolic_input_shapes = [list(inp.shape) for inp in example_inputs]
+            example_input_shapes = [list(inp.shape) for inp in example_inputs]
         else:
             input_dtypes = [example_inputs.dtype]
-            symbolic_input_shapes = [list(example_inputs.shape)]
+            example_input_shapes = [list(example_inputs.shape)]
 
-        # 2. ($symbolic_output_shapes <- $target <- ...)
+        # 2. ($output_shapes <- $target <- $example_inputs)
         output_shapes = self._infer_output_shapes(
-            target, input_dtypes, symbolic_input_shapes, example_inputs
+            target, example_inputs
         )
 
-        # 3. ($inserted_mut_input_nodes <- $gm_with_sub <- $symbolic_input_shapes <- $symbolic_output_shapes <- $placeholder_nodes)
+        # 3. ($inserted_mut_input_nodes <- $gm_with_sub <- $example_input_shapes <- $output_shapes <- $placeholder_nodes)
         mut_input_nodes = self._insert_empty_nodes(
             gm_with_sub, output_shapes, input_dtypes, placeholder_nodes
         )
@@ -74,59 +73,17 @@ class OutputAsMutInputsTransformer:
         new_gm.recompile()
         return new_gm, placeholder_nodes
 
-    def _infer_output_shapes(self, target, dtypes, in_shapes, example_inputs=None) -> List[List[Any]]:
-        # Try running with example_inputs first if provided
-        if example_inputs is not None:
-            with torch.no_grad():
-                outputs = target(*example_inputs)
-            if isinstance(outputs, (tuple, list)):
-                shapes = [list(o.shape) for o in outputs]
-                return shapes
-            return [list(outputs.shape)]
-
-        try:
-            from torch.export import export
-        except ImportError:
-            raise RuntimeError(
-                "Cannot infer output shapes: torch.export not available and no example_inputs provided. "
-                "Please provide example_inputs to infer output shapes."
-            )
-
-        try:
-            # Create example inputs
-            fake_inputs = []
-            for dtype, shape in zip(dtypes, in_shapes):
-                fake_inputs.append(torch.empty(shape, dtype=dtype))
-
-            # Export graph with shape info
-            ep = export(target, tuple(fake_inputs), dynamic_shapes=None)
-
-            # Get output shape
-            output_node = ep.graph_module.graph.output_node()
-            out_val = output_node.args[0]
-
-            def get_shape(val):
-                if isinstance(val, torch.Tensor):
-                    return [int(d) for d in val.shape]
-                elif isinstance(val, fx.Node):
-                    if "tensor_meta" in val.meta:
-                        return list(val.meta["tensor_meta"].shape)
-                return None
-
-            shape = get_shape(out_val)
-            if shape is None:
-                raise RuntimeError(
-                    "Cannot infer output shapes: export succeeded but shape info not available. "
-                    "Please provide example_inputs."
-                )
-            return [shape]
-
-        except Exception as e:
-            if isinstance(e, RuntimeError):
-                raise
-            raise RuntimeError(
-                f"Cannot infer output shapes: {e}. Please provide example_inputs."
-            ) from e
+    def _infer_output_shapes(
+        self,
+        target: fx.GraphModule,
+        example_inputs: List[torch.Tensor],
+    ) -> List[List[int]]:
+        """Infer output shapes by running the model with example_inputs."""
+        with torch.no_grad():
+            outputs = target(*example_inputs)
+        if isinstance(outputs, (tuple, list)):
+            return [list(o.shape) for o in outputs]
+        return [list(outputs.shape)]
 
     def _insert_empty_nodes(self, gm, out_shapes, dtypes, placeholder_nodes) -> List[fx.Node]:
         """Inline logic: Insert torch.empty at the beginning of the main graph."""
