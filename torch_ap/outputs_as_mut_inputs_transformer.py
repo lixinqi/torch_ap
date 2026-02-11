@@ -77,22 +77,39 @@ class OutputAsMutInputsTransformer:
         self,
         target: fx.GraphModule,
         example_inputs: List[torch.Tensor],
-    ) -> List[List[int]]:
-        """Infer output shapes by running the model with example_inputs."""
-        with torch.no_grad():
-            outputs = target(*example_inputs)
-        if isinstance(outputs, (tuple, list)):
-            return [list(o.shape) for o in outputs]
-        return [list(outputs.shape)]
+    ) -> List[List[torch.SymInt]]:
+        """Infer output shapes by running the model with example_inputs in FakeTensorMode."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        # Use FakeTensorMode to capture symbolic shapes (sym.Int)
+        with FakeTensorMode(shape_env=ShapeEnv()) as mode:
+            # Convert example_inputs to FakeTensors to enable symbolic reasoning
+            fake_inputs = []
+            for t in example_inputs:
+                if isinstance(t, torch._subclasses.fake_tensor.FakeTensor):
+                    # If it's already a FakeTensor, ensure it's in OUR mode to avoid "Mixing fake modes"
+                    fake_inputs.append(mode.from_tensor(t))
+                else:
+                    fake_inputs.append(mode.from_tensor(t))
+            
+            with torch.no_grad():
+                outputs = target(*fake_inputs)
+            
+            if isinstance(outputs, (tuple, list)):
+                return [list(o.shape) for o in outputs]
+            return [list(outputs.shape)]
 
     def _insert_empty_nodes(self, gm, out_shapes, dtypes, placeholder_nodes) -> List[fx.Node]:
-        """Inline logic: Insert torch.empty at the beginning of the main graph."""
+        """Inline logic: Insert torch.empty at the beginning of the main graph.
+        Supports symbolic shapes (list[list[sym.Int]]).
+        """
         first_node = next(iter(gm.graph.nodes))
         inserted = []
         with gm.graph.inserting_before(first_node):
             for shape in out_shapes:
                 node = gm.graph.call_function(
-                    torch.empty, args=(shape,), kwargs={"dtype": dtypes[0]}
+                    torch.empty, args=(tuple(shape),), kwargs={"dtype": dtypes[0]}
                 )
                 inserted.append(node)
 
