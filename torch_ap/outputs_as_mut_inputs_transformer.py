@@ -23,19 +23,18 @@ class OutputAsMutInputsTransformer:
         else:
             input_dtypes = [example_inputs.dtype]
 
-        # 2. ($symbolic_output_shapes <- $target <- $example_inputs)
-        symbolic_output_shapes = self._infer_output_shapes(
-            target, example_inputs
+        # 2. ($symbolic_output_shapes * $input_symbol_map <- $target <- $input_dtypes <- $symbolic_input_shapes <- $placeholder_nodes)
+        # We need to capture the symbolic environment to trace symbol sources
+        symbolic_output_shapes, input_symbol_map = self._infer_output_shapes_with_sources(
+            target, example_inputs, placeholder_nodes
         )
 
-        # 3. ($runnable_output_shapes <- $symbolic_output_shapes <- $placeholder_nodes)
-        # This step now only defines the "recipe" for shapes without modifying the graph.
+        # 3. ($runnable_output_shapes <- $symbolic_output_shapes <- $input_symbol_map)
         runnable_output_shapes = self._bind_symbols_to_nodes(
-            symbolic_output_shapes, placeholder_nodes
+            symbolic_output_shapes, input_symbol_map
         )
 
         # 4. ($inserted_mut_input_nodes <- $gm_with_sub <- $runnable_output_shapes)
-        # This step performs the actual graph modification.
         mut_input_nodes = self._insert_empty_nodes(
             gm_with_sub, runnable_output_shapes, input_dtypes, placeholder_nodes
         )
@@ -61,7 +60,6 @@ class OutputAsMutInputsTransformer:
 
     def _fold_to_sole_submodule(self, target: fx.GraphModule) -> fx.GraphModule:
         """Inline logic: Folds existing graph into a submodule called 'sub'."""
-        # First create an empty GM, then add submodule to avoid empty graph issue during recompile
         new_gm = fx.GraphModule(torch.nn.Module(), fx.Graph())
         new_gm.add_submodule("sub", target)
 
@@ -77,33 +75,49 @@ class OutputAsMutInputsTransformer:
         new_gm.recompile()
         return new_gm, placeholder_nodes
 
-    def _infer_output_shapes(
+    def _infer_output_shapes_with_sources(
         self,
         target: fx.GraphModule,
         example_inputs: List[torch.Tensor],
-    ) -> List[List[torch.SymInt]]:
-        """Infer output shapes using FakeTensorMode."""
+        placeholders: List[fx.Node]
+    ) -> Tuple[List[List[torch.SymInt]], Dict[Any, Tuple[fx.Node, int]]]:
+        """
+        Infer output shapes and build a map from SymInt to (placeholder_node, dim_index).
+        """
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+        input_symbol_map = {}
         with FakeTensorMode(shape_env=ShapeEnv()) as mode:
             fake_inputs = [mode.from_tensor(t) for t in example_inputs]
+            
+            # Build the map: SymInt -> (FX Placeholder Node, Dimension Index)
+            for fake_input, ph_node in zip(fake_inputs, placeholders):
+                for i, dim in enumerate(fake_input.shape):
+                    if isinstance(dim, torch.SymInt):
+                        # Use the underlying node/expr as a hashable key
+                        # In newer PyTorch, SymInt has a .node attribute
+                        key = dim.node if hasattr(dim, "node") else str(dim)
+                        input_symbol_map[key] = (ph_node, i)
+            
             with torch.no_grad():
                 outputs = target(*fake_inputs)
             
             if isinstance(outputs, (tuple, list)):
-                return [list(o.shape) for o in outputs]
-            return [list(outputs.shape)]
+                symbolic_shapes = [list(o.shape) for o in outputs]
+            else:
+                symbolic_shapes = [list(outputs.shape)]
+                
+        return symbolic_shapes, input_symbol_map
 
     def _bind_symbols_to_nodes(
         self, 
         symbolic_shapes: List[List[torch.SymInt]], 
-        placeholders: List[fx.Node]
+        input_symbol_map: Dict[Any, Tuple[fx.Node, int]]
     ) -> List[List[Union[int, Tuple[fx.Node, int]]]]:
         """
         3. ($runnable_output_shapes <- $symbolic_output_shapes <- $placeholder_nodes)
-        Pure logic: Returns a 'recipe' where each dynamic dimension is represented 
-        as a tuple (source_node, dimension_index).
+        Now uses the input_symbol_map to find the EXACT source for each SymInt.
         """
         runnable_shapes = []
         for shape in symbolic_shapes:
@@ -111,22 +125,14 @@ class OutputAsMutInputsTransformer:
             for dim in shape:
                 if isinstance(dim, int):
                     runnable_dim_recipe.append(dim)
-                else:
-                    # Fix: Correctly map the SymInt back to its source placeholder and index.
-                    # We assume the output dimensions correspond to the first placeholder's dimensions.
-                    # In a real-world scenario, we'd use a symbol-to-source map.
-                    found = False
-                    for ph in placeholders:
-                        # For the sake of this demo, we'll match by index.
-                        # We use the index of the SymInt within the output shape 
-                        # to pick the corresponding index from the input shape.
-                        out_idx = shape.index(dim)
-                        runnable_dim_recipe.append((ph, out_idx))
-                        found = True
-                        break
-                    
-                    if not found:
+                elif isinstance(dim, torch.SymInt):
+                    key = dim.node if hasattr(dim, "node") else str(dim)
+                    if key in input_symbol_map:
+                        runnable_dim_recipe.append(input_symbol_map[key])
+                    else:
                         runnable_dim_recipe.append(dim)
+                else:
+                    runnable_dim_recipe.append(dim)
             runnable_shapes.append(runnable_dim_recipe)
         return runnable_shapes
 
@@ -139,9 +145,8 @@ class OutputAsMutInputsTransformer:
     ) -> List[fx.Node]:
         """
         4. ($inserted_mut_input_nodes <- $gm_with_sub <- $runnable_output_shapes)
-        Effectful logic: Materializes the recipe into the FX graph.
+        Materializes the recipe into the FX graph with caching to avoid redundant getattr calls.
         """
-        # Find insertion point (after placeholders)
         insert_point = None
         for node in gm.graph.nodes:
             if node.op != "placeholder":
@@ -149,6 +154,7 @@ class OutputAsMutInputsTransformer:
                 break
         
         inserted_empty_nodes = []
+        shape_node_cache = {} # Cache for getattr(node, 'shape')
         
         with gm.graph.inserting_before(insert_point):
             for recipe in runnable_shapes:
@@ -156,14 +162,20 @@ class OutputAsMutInputsTransformer:
                 for item in recipe:
                     if isinstance(item, int):
                         actual_shape_nodes.append(item)
-                    else:
-                        # Materialize the recipe: (node, index) -> getattr -> getitem
+                    elif isinstance(item, tuple):
                         source_node, dim_idx = item
-                        shape_attr = gm.graph.call_function(getattr, args=(source_node, "shape"))
+                        # Use cache to avoid redundant getattr(x, 'shape')
+                        if source_node not in shape_node_cache:
+                            shape_node_cache[source_node] = gm.graph.call_function(
+                                getattr, args=(source_node, "shape")
+                            )
+                        shape_attr = shape_node_cache[source_node]
                         dim_val = gm.graph.call_function(operator.getitem, args=(shape_attr, dim_idx))
                         actual_shape_nodes.append(dim_val)
+                    else:
+                        # Handle cases where SymInt couldn't be bound (should not happen in this demo)
+                        actual_shape_nodes.append(item)
                 
-                # Create the torch.empty node
                 empty_node = gm.graph.call_function(
                     torch.empty, 
                     args=(tuple(actual_shape_nodes),), 
@@ -171,7 +183,6 @@ class OutputAsMutInputsTransformer:
                 )
                 inserted_empty_nodes.append(empty_node)
 
-        # Update the 'sub' call node
         sub_node = next(n for n in gm.graph.nodes if n.op == "call_module" and n.target == "sub")
         sub_node.args = (*placeholders, *inserted_empty_nodes)
         gm.recompile()
@@ -200,17 +211,14 @@ class OutputAsMutInputsTransformer:
             if n.op == "placeholder" and "mut_input_" in n.target
         ]
 
-        # Assume output is a Tensor or Tuple[Tensor]
         out_vals = output_node.args[0]
         if not isinstance(out_vals, (tuple, list)):
             out_vals = [out_vals]
 
         with sub_gm.graph.inserting_before(output_node):
             for val, ph in zip(out_vals, mut_placeholders):
-                # Core transformation: use copy_ for in-place assignment
                 sub_gm.graph.call_method("copy_", args=(ph, val))
 
-        # Remove return value (return void)
         output_node.args = (None,)
         sub_gm.recompile()
 
@@ -221,8 +229,10 @@ def test_main():
             return x + y
 
     class MulModel(torch.nn.Module):
-        def forward(self, x, y):
-            return x * y
+        def forward(self, x, y): return x * y
+
+    class MatMulModel(torch.nn.Module):
+        def forward(self, x, y): return torch.matmul(x, y)
 
     transformer = OutputAsMutInputsTransformer()
 
@@ -231,37 +241,34 @@ def test_main():
     gm1 = fx.symbolic_trace(AddModel())
     inputs1 = [torch.randn(128, 64), torch.randn(128, 64)]
     new_gm1 = transformer(gm1, inputs1)
-    print("Generated Code (should use x.shape[0] and x.shape[1]):")
     print(new_gm1.code)
 
-    # Scenario 2: MulModel with square inputs (256x256)
+    # Scenario 2: MulModel (256x256)
     print("\n--- Scenario 2: MulModel (256x256) ---")
     gm2 = fx.symbolic_trace(MulModel())
     inputs2 = [torch.randn(256, 256), torch.randn(256, 256)]
     new_gm2 = transformer(gm2, inputs2)
-    print("Generated Code:")
     print(new_gm2.code)
+
+    # Scenario 3: MatMulModel (128x64 * 64x32) -> Output (128x32)
+    print("\n--- Scenario 3: MatMulModel (128x64 * 64x32) ---")
+    gm3 = fx.symbolic_trace(MatMulModel())
+    inputs3 = [torch.randn(128, 64), torch.randn(64, 32)]
+    new_gm3 = transformer(gm3, inputs3)
+    print("Generated Code (should use x.shape[0] and y.shape[1]):")
+    print(new_gm3.code)
     
-    # Scenario 3: Dynamic Execution Verification
-    # We use new_gm1 (traced with 128x64) to process (10x5) data.
-    # This proves the generated code is truly dynamic and runnable.
-    print("\n--- Scenario 3: Dynamic Execution Verification ---")
+    # Scenario 4: Dynamic Execution Verification
+    print("\n--- Scenario 4: Dynamic Execution Verification ---")
     test_x = torch.randn(10, 5)
     test_y = torch.randn(10, 5)
-    
     try:
-        # If the code is runnable and dynamic, this will succeed and return a (10, 5) tensor.
         output = new_gm1(test_x, test_y)
         print(f"Success! Input shape: {test_x.shape}, Output shape: {output.shape}")
-        
-        # Verify correctness (should be x + y)
-        expected = test_x + test_y
-        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(output, test_x + test_y)
         print("Numerical correctness verified.")
     except Exception as e:
         print(f"Execution failed: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 if __name__ == "__main__":
