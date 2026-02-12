@@ -63,7 +63,6 @@ class OutputAsMutInputsTransformer:
         new_gm = fx.GraphModule(torch.nn.Module(), fx.Graph())
         new_gm.add_submodule("sub", target)
 
-        # Now build the graph
         new_graph = new_gm.graph
         placeholder_nodes = []
         for n in target.graph.nodes:
@@ -74,6 +73,18 @@ class OutputAsMutInputsTransformer:
         new_graph.call_module("sub", args=tuple(placeholder_nodes))
         new_gm.recompile()
         return new_gm, placeholder_nodes
+
+    def _extract_input_symbols(
+        self, 
+        fake_input: torch.Tensor, 
+        ph_node: fx.Node, 
+        symbol_map: Dict[Any, Tuple[fx.Node, int]]
+    ):
+        """Helper to map SymInts from a single input to their source node and index."""
+        for i, dim in enumerate(fake_input.shape):
+            if isinstance(dim, torch.SymInt):
+                key = dim.node if hasattr(dim, "node") else str(dim)
+                symbol_map[key] = (ph_node, i)
 
     def _infer_output_shapes_with_sources(
         self,
@@ -91,24 +102,33 @@ class OutputAsMutInputsTransformer:
         with FakeTensorMode(shape_env=ShapeEnv()) as mode:
             fake_inputs = [mode.from_tensor(t) for t in example_inputs]
             
-            # Build the map: SymInt -> (FX Placeholder Node, Dimension Index)
+            # Build the map using a helper to reduce nesting
             for fake_input, ph_node in zip(fake_inputs, placeholders):
-                for i, dim in enumerate(fake_input.shape):
-                    if isinstance(dim, torch.SymInt):
-                        # Use the underlying node/expr as a hashable key
-                        # In newer PyTorch, SymInt has a .node attribute
-                        key = dim.node if hasattr(dim, "node") else str(dim)
-                        input_symbol_map[key] = (ph_node, i)
+                self._extract_input_symbols(fake_input, ph_node, input_symbol_map)
             
             with torch.no_grad():
                 outputs = target(*fake_inputs)
             
-            if isinstance(outputs, (tuple, list)):
-                symbolic_shapes = [list(o.shape) for o in outputs]
-            else:
-                symbolic_shapes = [list(outputs.shape)]
+            symbolic_shapes = [list(o.shape) for o in (outputs if isinstance(outputs, (tuple, list)) else [outputs])]
                 
         return symbolic_shapes, input_symbol_map
+
+    def _bind_single_shape(
+        self, 
+        shape: List[torch.SymInt], 
+        input_symbol_map: Dict[Any, Tuple[fx.Node, int]]
+    ) -> List[Union[int, Tuple[fx.Node, int]]]:
+        """Helper to bind a single shape's SymInts to their sources."""
+        recipe = []
+        for dim in shape:
+            if isinstance(dim, int):
+                recipe.append(dim)
+            elif isinstance(dim, torch.SymInt):
+                key = dim.node if hasattr(dim, "node") else str(dim)
+                recipe.append(input_symbol_map.get(key, dim))
+            else:
+                recipe.append(dim)
+        return recipe
 
     def _bind_symbols_to_nodes(
         self, 
@@ -116,25 +136,32 @@ class OutputAsMutInputsTransformer:
         input_symbol_map: Dict[Any, Tuple[fx.Node, int]]
     ) -> List[List[Union[int, Tuple[fx.Node, int]]]]:
         """
-        3. ($runnable_output_shapes <- $symbolic_output_shapes <- $placeholder_nodes)
-        Now uses the input_symbol_map to find the EXACT source for each SymInt.
+        3. ($runnable_output_shapes <- $symbolic_output_shapes <- $input_symbol_map)
+        Uses helpers to reduce nesting while finding the EXACT source for each SymInt.
         """
-        runnable_shapes = []
-        for shape in symbolic_shapes:
-            runnable_dim_recipe = []
-            for dim in shape:
-                if isinstance(dim, int):
-                    runnable_dim_recipe.append(dim)
-                elif isinstance(dim, torch.SymInt):
-                    key = dim.node if hasattr(dim, "node") else str(dim)
-                    if key in input_symbol_map:
-                        runnable_dim_recipe.append(input_symbol_map[key])
-                    else:
-                        runnable_dim_recipe.append(dim)
-                else:
-                    runnable_dim_recipe.append(dim)
-            runnable_shapes.append(runnable_dim_recipe)
-        return runnable_shapes
+        return [self._bind_single_shape(shape, input_symbol_map) for shape in symbolic_shapes]
+
+    def _materialize_shape(
+        self, 
+        gm: fx.GraphModule, 
+        recipe: List[Union[int, Tuple[fx.Node, int]]],
+        cache: Dict[fx.Node, fx.Node]
+    ) -> Tuple[Any, ...]:
+        """Helper to convert a shape recipe into a tuple of FX nodes/ints."""
+        actual_shape_nodes = []
+        for item in recipe:
+            if isinstance(item, int):
+                actual_shape_nodes.append(item)
+            elif isinstance(item, tuple):
+                source_node, dim_idx = item
+                if source_node not in cache:
+                    cache[source_node] = gm.graph.call_function(getattr, args=(source_node, "shape"))
+                shape_attr = cache[source_node]
+                dim_val = gm.graph.call_function(operator.getitem, args=(shape_attr, dim_idx))
+                actual_shape_nodes.append(dim_val)
+            else:
+                actual_shape_nodes.append(item)
+        return tuple(actual_shape_nodes)
 
     def _insert_empty_nodes(
         self, 
@@ -145,40 +172,20 @@ class OutputAsMutInputsTransformer:
     ) -> List[fx.Node]:
         """
         4. ($inserted_mut_input_nodes <- $gm_with_sub <- $runnable_output_shapes)
-        Materializes the recipe into the FX graph with caching to avoid redundant getattr calls.
+        Materializes the recipe into the FX graph.
         """
-        insert_point = None
-        for node in gm.graph.nodes:
-            if node.op != "placeholder":
-                insert_point = node
-                break
-        
+        insert_point = next(n for n in gm.graph.nodes if n.op != "placeholder")
         inserted_empty_nodes = []
         shape_node_cache = {} # Cache for getattr(node, 'shape')
         
         with gm.graph.inserting_before(insert_point):
             for recipe in runnable_shapes:
-                actual_shape_nodes = []
-                for item in recipe:
-                    if isinstance(item, int):
-                        actual_shape_nodes.append(item)
-                    elif isinstance(item, tuple):
-                        source_node, dim_idx = item
-                        # Use cache to avoid redundant getattr(x, 'shape')
-                        if source_node not in shape_node_cache:
-                            shape_node_cache[source_node] = gm.graph.call_function(
-                                getattr, args=(source_node, "shape")
-                            )
-                        shape_attr = shape_node_cache[source_node]
-                        dim_val = gm.graph.call_function(operator.getitem, args=(shape_attr, dim_idx))
-                        actual_shape_nodes.append(dim_val)
-                    else:
-                        # Handle cases where SymInt couldn't be bound (should not happen in this demo)
-                        actual_shape_nodes.append(item)
+                # Materialize the shape recipe into actual FX nodes
+                actual_shape = self._materialize_shape(gm, recipe, shape_node_cache)
                 
                 empty_node = gm.graph.call_function(
                     torch.empty, 
-                    args=(tuple(actual_shape_nodes),), 
+                    args=(actual_shape,), 
                     kwargs={"dtype": dtypes[0]}
                 )
                 inserted_empty_nodes.append(empty_node)
@@ -222,11 +229,40 @@ class OutputAsMutInputsTransformer:
         output_node.args = (None,)
         sub_gm.recompile()
 
+
+def run_dynamic_test(name, model, example_inputs, dynamic_test_inputs):
+    print(f"\n=== {name} ===")
+
+    transformer = OutputAsMutInputsTransformer()
+    gm = fx.symbolic_trace(model)
+    new_gm = transformer(gm, example_inputs)
+
+    print("\n--- Transformed Code ---")
+    print(new_gm.code)
+
+    print("\n--- Dynamic Shape Tests ---")
+
+    for inputs in dynamic_test_inputs:
+        shapes = [tuple(t.shape) for t in inputs]
+        try:
+            out = new_gm(*inputs)
+            ref = model(*inputs)
+
+            correct = torch.allclose(out, ref)
+
+            print(f"✅ Input shapes {shapes} "
+                  f"→ Output shape {tuple(out.shape)} "
+                  f"| Correct: {correct}")
+
+        except Exception as e:
+            print(f"❌ Input shapes {shapes} FAILED")
+            print(f"   Error: {e}")
+
+
 def test_main():
-    # Define two different models to test transformer reusability
+
     class AddModel(torch.nn.Module):
-        def forward(self, x, y):
-            return x + y
+        def forward(self, x, y): return x + y
 
     class MulModel(torch.nn.Module):
         def forward(self, x, y): return x * y
@@ -234,41 +270,57 @@ def test_main():
     class MatMulModel(torch.nn.Module):
         def forward(self, x, y): return torch.matmul(x, y)
 
-    transformer = OutputAsMutInputsTransformer()
+    # -------------------------------------------------
+    # Scenario 1: AddModel
+    # -------------------------------------------------
+    run_dynamic_test(
+        name="Scenario 1: AddModel (base: 128x64)",
+        model=AddModel(),
+        example_inputs=[
+            torch.randn(128, 64),
+            torch.randn(128, 64),
+        ],
+        dynamic_test_inputs=[
+            (torch.randn(128, 64), torch.randn(128, 64)),  # original
+            (torch.randn(256, 64), torch.randn(256, 64)),  # change batch
+            (torch.randn(32, 64), torch.randn(32, 64)),    # smaller batch
+            (torch.randn(128, 128), torch.randn(128, 128)) # change feature dim
+        ]
+    )
 
-    # Scenario 1: AddModel with non-square inputs (128x64)
-    print("\n--- Scenario 1: AddModel (128x64) ---")
-    gm1 = fx.symbolic_trace(AddModel())
-    inputs1 = [torch.randn(128, 64), torch.randn(128, 64)]
-    new_gm1 = transformer(gm1, inputs1)
-    print(new_gm1.code)
+    # -------------------------------------------------
+    # Scenario 2: MulModel
+    # -------------------------------------------------
+    run_dynamic_test(
+        name="Scenario 2: MulModel (base: 256x256)",
+        model=MulModel(),
+        example_inputs=[
+            torch.randn(256, 256),
+            torch.randn(256, 256),
+        ],
+        dynamic_test_inputs=[
+            (torch.randn(256, 256), torch.randn(256, 256)),
+            (torch.randn(128, 256), torch.randn(128, 256)),
+            (torch.randn(256, 128), torch.randn(256, 128)),
+        ]
+    )
 
-    # Scenario 2: MulModel (256x256)
-    print("\n--- Scenario 2: MulModel (256x256) ---")
-    gm2 = fx.symbolic_trace(MulModel())
-    inputs2 = [torch.randn(256, 256), torch.randn(256, 256)]
-    new_gm2 = transformer(gm2, inputs2)
-    print(new_gm2.code)
-
-    # Scenario 3: MatMulModel (128x64 * 64x32) -> Output (128x32)
-    print("\n--- Scenario 3: MatMulModel (128x64 * 64x32) ---")
-    gm3 = fx.symbolic_trace(MatMulModel())
-    inputs3 = [torch.randn(128, 64), torch.randn(64, 32)]
-    new_gm3 = transformer(gm3, inputs3)
-    print("Generated Code (should use x.shape[0] and y.shape[1]):")
-    print(new_gm3.code)
-    
-    # Scenario 4: Dynamic Execution Verification
-    print("\n--- Scenario 4: Dynamic Execution Verification ---")
-    test_x = torch.randn(10, 5)
-    test_y = torch.randn(10, 5)
-    try:
-        output = new_gm1(test_x, test_y)
-        print(f"Success! Input shape: {test_x.shape}, Output shape: {output.shape}")
-        torch.testing.assert_close(output, test_x + test_y)
-        print("Numerical correctness verified.")
-    except Exception as e:
-        print(f"Execution failed: {e}")
+    # -------------------------------------------------
+    # Scenario 3: MatMulModel
+    # -------------------------------------------------
+    run_dynamic_test(
+        name="Scenario 3: MatMulModel (base: 128x64 @ 64x32)",
+        model=MatMulModel(),
+        example_inputs=[
+            torch.randn(128, 64),
+            torch.randn(64, 32),
+        ],
+        dynamic_test_inputs=[
+            (torch.randn(128, 64), torch.randn(64, 32)),
+            (torch.randn(256, 64), torch.randn(64, 32)),   # change batch
+            (torch.randn(128, 128), torch.randn(128, 16)), # change inner dims
+        ]
+    )
 
 
 if __name__ == "__main__":
