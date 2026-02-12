@@ -1,10 +1,10 @@
 import torch.fx as fx
 from torch.fx.passes.infra.pass_manager import PassResult
-from torch_ap.torch_ap_trace import torch_ap_trace
+from tst.torch_ap.torch_ap_trace import torch_ap_trace
 
 # --- ImportFrom (Viba defined mappings) ---
-from torch_ap.trivial_ops_util import get_trivial_ops_ranges, is_trivial_op
-from torch_ap.submodule_fold_util import convert_to_submodules_graph
+from tst.torch_ap.trivial_ops_util import get_trivial_ops_ranges, is_trivial_op
+from tst.torch_ap.submodule_fold_util import convert_to_submodules_graph
 
 # --- Core Functor Implementation ---
 

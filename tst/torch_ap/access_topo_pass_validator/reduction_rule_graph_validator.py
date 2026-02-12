@@ -2,7 +2,7 @@ import torch
 import torch.fx as fx
 import networkx as nx
 from typing import Any
-from torch_ap.spider import up_spider, down_spider
+from tst.torch_ap.spider import up_spider, down_spider
 
 
 class ReductionRuleGraphValidator:

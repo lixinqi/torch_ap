@@ -1,9 +1,9 @@
 import torch
 import torch.fx as fx
 from typing import List, Union
-from torch_ap.load_store_op import store
+from tst.torch_ap.load_store_op import store
 from torch.fx.passes.infra.pass_manager import PassResult
-from torch_ap.torch_ap_trace import torch_ap_trace
+from tst.torch_ap.torch_ap_trace import torch_ap_trace
 
 
 class StoreOpInserterPass:

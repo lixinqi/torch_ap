@@ -3,23 +3,23 @@ import torch.fx as fx
 from typing import Callable, List, Dict, Any, Union, Optional, Tuple
 
 # --- Imports (No local definitions or decorators, just use) ---
-from torch_ap.torch_ap_trace import torch_ap_trace
-from torch_ap.spider import down_spider as DS, up_spider as US
-from torch_ap.load_store_op import load, store
+from tst.torch_ap.torch_ap_trace import torch_ap_trace
+from tst.torch_ap.spider import down_spider as DS, up_spider as US
+from tst.torch_ap.load_store_op import load, store
 from torch.fx.passes.infra.pass_manager import PassManager, PassResult
-from torch_ap.concrete_pass.demo_matmul_epilogue_replacer_pass import (
+from tst.torch_ap.concrete_pass.demo_matmul_epilogue_replacer_pass import (
     DemoMatmulEpilogueReplacerPass,
 )
-from torch_ap.trivial_ops_folder_pass import TrivialOpsFolderPass
-from torch_ap.concrete_pass.matmul_epilogue_extractor_pass import (
+from tst.torch_ap.trivial_ops_folder_pass import TrivialOpsFolderPass
+from tst.torch_ap.concrete_pass.matmul_epilogue_extractor_pass import (
     MatmulEpilogueExtractorPass,
 )
-from torch_ap.load_op_inserter_pass import LoadOpInserterPass
-from torch_ap.store_op_inserter_pass import StoreOpInserterPass
-from torch_ap.concrete_pass.down_spider_inserter_pass import DownSpiderInserterPass
-from torch_ap.pattern_replacer_pass import PatternReplacerPass
-from torch_ap.pattern_remover_pass import PatternRemoverPass
-from torch_ap.concrete_pass.matmul_epilogue_util import (
+from tst.torch_ap.load_op_inserter_pass import LoadOpInserterPass
+from tst.torch_ap.store_op_inserter_pass import StoreOpInserterPass
+from tst.torch_ap.concrete_pass.down_spider_inserter_pass import DownSpiderInserterPass
+from tst.torch_ap.pattern_replacer_pass import PatternReplacerPass
+from tst.torch_ap.pattern_remover_pass import PatternRemoverPass
+from tst.torch_ap.concrete_pass.matmul_epilogue_util import (
     get_matmul_epilogue_arg_name_to_is_mm_out,
 )
 

@@ -4,7 +4,7 @@ import inspect
 import string
 from typing import Any
 from torch.fx.passes.infra.pass_manager import PassResult
-from torch_ap.torch_ap_trace import torch_ap_trace
+from tst.torch_ap.torch_ap_trace import torch_ap_trace
 from typing import Callable, List
 
 

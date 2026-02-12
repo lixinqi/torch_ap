@@ -1,9 +1,9 @@
 import torch
 import torch.fx as fx
 
-from torch_ap.ap_pass import ApPass
-from torch_ap.match_replace_util import MatchContext
-from torch_ap.torch_ap_trace import torch_ap_trace
+from tst.torch_ap.ap_pass import ApPass
+from tst.torch_ap.match_replace_util import MatchContext
+from tst.torch_ap.torch_ap_trace import torch_ap_trace
 
 
 class PatternModule(torch.nn.Module):
@@ -72,7 +72,7 @@ if __name__ == "__main__":
 
     t_gm = fx.GraphModule(TargetModel(), tracer.trace(TargetModel()))
     from torch.fx.passes.infra.pass_manager import PassManager
-    from torch_ap.trivial_ops_folder_pass import TrivialOpsFolderPass
+    from tst.torch_ap.trivial_ops_folder_pass import TrivialOpsFolderPass
 
     pass_mgr = PassManager(
         [

@@ -2,7 +2,7 @@ import torch
 import torch.fx as fx
 from dataclasses import dataclass
 from typing import Callable, Any, Dict, List, Optional
-from torch_ap.torch_ap_trace import torch_ap_trace
+from tst.torch_ap.torch_ap_trace import torch_ap_trace
 
 
 @dataclass

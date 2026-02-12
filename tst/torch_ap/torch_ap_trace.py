@@ -1,6 +1,6 @@
 import torch
 import torch.fx as fx
-import torch_ap.ops as ops
+import tst.torch_ap.ops as ops
 
 
 def torch_ap_trace(f):

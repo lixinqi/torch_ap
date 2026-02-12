@@ -1,8 +1,8 @@
 import torch
 import torch.fx as fx
 from torch.fx.passes.infra.pass_manager import PassResult
-from torch_ap.torch_ap_trace import torch_ap_trace
-from torch_ap.match_replace_util import (
+from tst.torch_ap.torch_ap_trace import torch_ap_trace
+from tst.torch_ap.match_replace_util import (
     MatchContext,
     fx_graph_match_first_pattern,
     fx_graph_replace_first_pattern,
